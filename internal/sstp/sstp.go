@@ -146,6 +146,11 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	// Create a buffered reader for HTTP parsing
 	reader := bufio.NewReader(conn)
 
+	// Set a read timeout to prevent hanging on malformed requests
+	if tcpConn, ok := conn.(*tls.Conn); ok {
+		tcpConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	}
+
 	// Parse initial HTTP request
 	req, err := http.ReadRequest(reader)
 	if err != nil {
@@ -153,11 +158,32 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 
+	// Reset the read deadline
+	if tcpConn, ok := conn.(*tls.Conn); ok {
+		tcpConn.SetReadDeadline(time.Time{})
+	}
+
+	// Validate Content-Length to prevent integer overflow issues
+	if req.ContentLength < 0 || req.ContentLength > 100*1024*1024 { // 100MB limit
+		s.logger.Warnf("Invalid Content-Length %d from %s, closing connection", req.ContentLength, remoteAddr)
+		// Send HTTP error response manually
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nBad Request"))
+		return
+	}
+
 	// Check if this is an SSTP connection request
 	if req.Method != "SSTP_DUPLEX_POST" {
-		s.logger.Warnf("Invalid SSTP request from %s", remoteAddr)
-		// We can't use http.Error here because we're not in an HTTP handler context
-		// Just close the connection
+		s.logger.Warnf("Invalid SSTP request method '%s' from %s", req.Method, remoteAddr)
+		// Send proper HTTP error response
+		conn.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: 18\r\n\r\nMethod Not Allowed"))
+		return
+	}
+
+	// Validate Content-Type
+	expectedContentType := "application/sstp"
+	if req.Header.Get("Content-Type") != expectedContentType {
+		s.logger.Warnf("Invalid Content-Type '%s' from %s, expected '%s'", req.Header.Get("Content-Type"), remoteAddr, expectedContentType)
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nBad Request"))
 		return
 	}
 
