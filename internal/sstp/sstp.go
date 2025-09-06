@@ -26,6 +26,7 @@ const (
 
 	msgCallConnectRequest = 0x0001
 	msgCallConnectAck     = 0x0002
+	msgCallConnected      = 0x0004
 )
 
 type Server struct {
@@ -52,11 +53,9 @@ type SSTPSession struct {
 
 func NewServer(cfg *config.Config, logger *logging.Logger) (*Server, error) {
 	server := &Server{
-		config: cfg,
-		logger: logger,
-		sessions: &SessionManager{
-			sessions: make(map[string]*SSTPSession),
-		},
+		config:   cfg,
+		logger:   logger,
+		sessions: &SessionManager{sessions: make(map[string]*SSTPSession)},
 	}
 
 	publicIP, err := netutil.GetPublicIP()
@@ -69,13 +68,7 @@ func NewServer(cfg *config.Config, logger *logging.Logger) (*Server, error) {
 		return nil, fmt.Errorf("failed to ensure CA: %w", err)
 	}
 
-	if err := pki.EnsureServerCertForIP(
-		cfg.ServerCertPath,
-		cfg.ServerKeyPath,
-		cfg.CACertPath,
-		cfg.CAKeyPath,
-		publicIP,
-	); err != nil {
+	if err := pki.EnsureServerCertForIP(cfg.ServerCertPath, cfg.ServerKeyPath, cfg.CACertPath, cfg.CAKeyPath, publicIP); err != nil {
 		return nil, fmt.Errorf("failed to ensure server certificate: %w", err)
 	}
 
@@ -179,9 +172,9 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		}
 	}
 
-	// Per MS-SSTP 4.1: respond with 200, ULONGLONG_MAX Content-Length, server header. No Content-Type.
 	resp := "HTTP/1.1 200 OK\r\n" +
 		"Content-Length: 18446744073709551615\r\n" +
+		"Connection: Keep-Alive\r\n" +
 		"Server: Microsoft-HTTPAPI/2.0\r\n" +
 		"\r\n"
 	if _, err := io.WriteString(conn, resp); err != nil {
@@ -219,7 +212,8 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 }
 
 func (s *Server) runSSTP(ctx context.Context, session *SSTPSession, r *bufio.Reader) error {
-	// expect CALL_CONNECT_REQUEST
+	s.logger.Debugf("Waiting for CALL_CONNECT_REQUEST for session %s", session.ID)
+
 	hdr, payload, err := readSSTPPacket(r)
 	if err != nil {
 		return fmt.Errorf("read first SSTP packet: %w", err)
@@ -227,18 +221,24 @@ func (s *Server) runSSTP(ctx context.Context, session *SSTPSession, r *bufio.Rea
 	if !hdr.control || len(payload) < 4 {
 		return fmt.Errorf("unexpected first SSTP packet")
 	}
-	if binary.BigEndian.Uint16(payload[0:2]) != msgCallConnectRequest {
-		return fmt.Errorf("unexpected control message 0x%04x", binary.BigEndian.Uint16(payload[0:2]))
+	t := binary.BigEndian.Uint16(payload[0:2])
+	if t != msgCallConnectRequest {
+		return fmt.Errorf("unexpected control message 0x%04x", t)
 	}
+	s.logger.Debugf("Got CALL_CONNECT_REQUEST for session %s", session.ID)
 
-	// reply with CALL_CONNECT_ACK including Crypto Binding Request
 	if err := writeCallConnectAck(session.Conn); err != nil {
 		return fmt.Errorf("write CALL_CONNECT_ACK: %w", err)
 	}
+	s.logger.Debugf("Sent CALL_CONNECT_ACK for session %s", session.ID)
+
+	if err := writeCallConnected(session.Conn); err != nil {
+		return fmt.Errorf("write CALL_CONNECTED: %w", err)
+	}
+	s.logger.Debugf("Sent CALL_CONNECTED for session %s", session.ID)
 
 	errCh := make(chan error, 2)
 
-	// client -> PPP
 	go func() {
 		for {
 			h, pl, err := readSSTPPacket(r)
@@ -254,13 +254,10 @@ func (s *Server) runSSTP(ctx context.Context, session *SSTPSession, r *bufio.Rea
 					errCh <- werr
 					return
 				}
-			} else {
-				// ignore further control for now, client will later send CALL_CONNECTED
 			}
 		}
 	}()
 
-	// PPP -> client
 	go func() {
 		buf := make([]byte, 4096)
 		for {
@@ -320,29 +317,42 @@ func readSSTPPacket(r *bufio.Reader) (sstpHeader, []byte, error) {
 }
 
 func writeCallConnectAck(w io.Writer) error {
-	// control message header: type and attributes count
 	body := make([]byte, 0, 48-4)
 	tmp := make([]byte, 4)
 	binary.BigEndian.PutUint16(tmp[0:2], msgCallConnectAck)
 	binary.BigEndian.PutUint16(tmp[2:4], 1)
 	body = append(body, tmp...)
 
-	// attribute: Crypto Binding Request (ID 0x04), length 0x028
-	body = append(body, 0x00) // Reserved
-	body = append(body, 0x04) // Attribute ID
+	body = append(body, 0x00)
+	body = append(body, 0x04)
 	len1 := uint16(0x028)
 	tmp2 := make([]byte, 2)
 	binary.BigEndian.PutUint16(tmp2, len1&0x0FFF)
 	body = append(body, tmp2...)
-	body = append(body, 0x00, 0x00, 0x00) // Reserved1
+	body = append(body, 0x00, 0x00, 0x00)
 
-	// hash protocol bitmask: allow SHA1 and SHA256
 	body = append(body, byte(0x03))
-
-	// nonce 32 bytes
 	nonce := make([]byte, 32)
 	_, _ = rand.Read(nonce)
 	body = append(body, nonce...)
+
+	totalLen := uint16(4 + len(body))
+	hdr := make([]byte, 4)
+	hdr[0] = sstpVersion10
+	hdr[1] = ctrlBit
+	binary.BigEndian.PutUint16(hdr[2:4], totalLen&0x0FFF)
+
+	if _, err := w.Write(hdr); err != nil {
+		return err
+	}
+	_, err := w.Write(body)
+	return err
+}
+
+func writeCallConnected(w io.Writer) error {
+	body := make([]byte, 4)
+	binary.BigEndian.PutUint16(body[0:2], msgCallConnected)
+	binary.BigEndian.PutUint16(body[2:4], 0)
 
 	totalLen := uint16(4 + len(body))
 	hdr := make([]byte, 4)
@@ -382,22 +392,19 @@ func writeSSTPDataPacket(w io.Writer, payload []byte) error {
 	return nil
 }
 
-func (s *Server) Wait() { s.wg.Wait() }
-
+func (s *Server) Wait()                           { s.wg.Wait() }
 func (s *Server) GetSessions() []*ppp.SessionInfo { return s.sessions.GetSessions() }
 
 func (sm *SessionManager) add(session *SSTPSession) {
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
 	sm.sessions[session.ID] = session
+	sm.mu.Unlock()
 }
-
 func (sm *SessionManager) remove(sessionID string) {
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
 	delete(sm.sessions, sessionID)
+	sm.mu.Unlock()
 }
-
 func (sm *SessionManager) GetSessions() []*ppp.SessionInfo {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
