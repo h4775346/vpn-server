@@ -229,13 +229,12 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 }
 
 func (s *Server) negotiate(r *bufio.Reader, w io.Writer) error {
-	// 1) اقرأ ترويسة SSTP
+	// read SSTP header
 	hdr := make([]byte, 4)
 	if _, err := io.ReadFull(r, hdr); err != nil {
 		return fmt.Errorf("read header: %w", err)
 	}
 	if hdr[0] != sstpV10 || (hdr[1]&ctrlBit) == 0 {
-		s.logger.Errorf("bad first 4 bytes: %02x %02x %02x %02x", hdr[0], hdr[1], hdr[2], hdr[3])
 		return fmt.Errorf("invalid CCR header")
 	}
 	length := int(binary.BigEndian.Uint16(hdr[2:]) & 0x0FFF)
@@ -243,7 +242,7 @@ func (s *Server) negotiate(r *bufio.Reader, w io.Writer) error {
 		return fmt.Errorf("short CCR length %d", length)
 	}
 
-	// 2) جسم الرسالة
+	// read body
 	body := make([]byte, length-4)
 	if _, err := io.ReadFull(r, body); err != nil {
 		return fmt.Errorf("read body: %w", err)
@@ -252,44 +251,67 @@ func (s *Server) negotiate(r *bufio.Reader, w io.Writer) error {
 		return fmt.Errorf("expected CALL_CONNECT_REQUEST")
 	}
 
-	// 3) افحص السمات بتسلسل حتى نهاية الجسم
-	// تنسيق السمة: [Reserved:1][AttrID:1][Len:2 شامل الترويسة][Value...]
+	// parse attributes; accept both formats:
+	// A: [Reserved:1][AttrID:1][Len:2][Value...]
+	// B: [AttrID:1][Len:2][Value...]   (seen on MikroTik)
 	encapOK := false
-	for pos := 5; pos+4 <= len(body); {
-		attrID := int(body[pos+1])
-		alen := int(binary.BigEndian.Uint16(body[pos+2:pos+4]) & 0x0FFF)
-
-		// تحقق صرامي
-		if alen < 4 || pos+alen > len(body) {
-			s.logger.Errorf("malformed attribute id=%d len=%d at pos=%d bodylen=%d", attrID, alen, pos, len(body))
-			return fmt.Errorf("malformed attribute")
+	for pos := 2 + 2 + 1; pos < len(body); {
+		remain := len(body) - pos
+		if remain < 3 { // need at least id+len
+			break
 		}
 
-		valStart := pos + 4
-		valEnd := pos + alen
-
-		if attrID == attrEncapsulatedProto {
-			if valEnd-valStart >= 2 {
-				proto := binary.BigEndian.Uint16(body[valStart : valStart+2])
-				if proto == encapPPP {
-					encapOK = true
-				}
+		// try layout A
+		useA := false
+		var idA byte
+		var lenA int
+		if remain >= 4 {
+			idA = body[pos+1]
+			lenA = int(binary.BigEndian.Uint16(body[pos+2:pos+4]) & 0x0FFF)
+			if lenA >= 4 && pos+lenA <= len(body) && idA != 0 {
+				useA = true
 			}
 		}
 
+		if useA {
+			valStart := pos + 4
+			valEnd := pos + lenA
+			if idA == attrEncapsulatedProto {
+				if valEnd-valStart >= 2 && binary.BigEndian.Uint16(body[valStart:valStart+2]) == encapPPP {
+					encapOK = true
+				}
+			}
+			pos = valEnd
+			continue
+		}
+
+		// fallback layout B
+		idB := body[pos]
+		lenB := int(binary.BigEndian.Uint16(body[pos+1:pos+3]) & 0x0FFF)
+		if lenB < 3 || pos+lenB > len(body) {
+			return fmt.Errorf("malformed attribute")
+		}
+		valStart := pos + 3
+		valEnd := pos + lenB
+		if idB == attrEncapsulatedProto {
+			if valEnd-valStart >= 2 && binary.BigEndian.Uint16(body[valStart:valStart+2]) == encapPPP {
+				encapOK = true
+			}
+		}
 		pos = valEnd
 	}
+
 	if !encapOK {
 		return fmt.Errorf("client did not propose PPP encapsulation")
 	}
 
-	// 4) أرسل Call Connect Ack مع Crypto Binding Request
+	// send Call Connect Ack with Crypto Binding Request
 	ack := s.buildCCAWithCBR()
 	if _, err := w.Write(ack); err != nil {
 		return fmt.Errorf("write CCA: %w", err)
 	}
 
-	// 5) أرسل Call Connected مبكراً، مقبول لدى MikroTik
+	// send Call Connected
 	cc := buildCallConnected()
 	if _, err := w.Write(cc); err != nil {
 		return fmt.Errorf("write CC: %w", err)
