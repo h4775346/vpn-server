@@ -163,14 +163,6 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		tcpConn.SetReadDeadline(time.Time{})
 	}
 
-	// Validate Content-Length to prevent integer overflow issues
-	if req.ContentLength < 0 || req.ContentLength > 100*1024*1024 { // 100MB limit
-		s.logger.Warnf("Invalid Content-Length %d from %s, closing connection", req.ContentLength, remoteAddr)
-		// Send HTTP error response manually
-		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nBad Request"))
-		return
-	}
-
 	// Check if this is an SSTP connection request
 	if req.Method != "SSTP_DUPLEX_POST" {
 		s.logger.Warnf("Invalid SSTP request method '%s' from %s", req.Method, remoteAddr)
@@ -179,10 +171,19 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	// Validate Content-Type
+	// Validate Content-Type for SSTP
 	expectedContentType := "application/sstp"
 	if req.Header.Get("Content-Type") != expectedContentType {
 		s.logger.Warnf("Invalid Content-Type '%s' from %s, expected '%s'", req.Header.Get("Content-Type"), remoteAddr, expectedContentType)
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nBad Request"))
+		return
+	}
+
+	// For SSTP, Content-Length of 18446744073709551615 (ULONGLONG_MAX) is valid
+	// This indicates an unlimited or unknown content length, which is expected for tunneling
+	// Note: Go's HTTP parser will parse this as -1 due to overflow, which is the correct behavior
+	if req.ContentLength != -1 && req.ContentLength > 100*1024*1024 { // 100MB limit for non-SSTP requests
+		s.logger.Warnf("Invalid Content-Length %d from %s, closing connection", req.ContentLength, remoteAddr)
 		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nBad Request"))
 		return
 	}

@@ -76,8 +76,27 @@ For production deployment, the server can be installed as a systemd service:
 3. Enable the service: `sudo systemctl enable sstpd`
 4. Start the service: `sudo systemctl start sstpd`
 
+## Automatic Deployment
+
+A deployment script [deploy.sh](deploy.sh) is provided to automate the process of updating, building, and restarting the service. To use it:
+
+1. Transfer the script to your Linux server
+2. Make it executable: `chmod +x deploy.sh`
+3. Run with sudo: `sudo ./deploy.sh`
+
+The script will:
+- Pull the latest changes from git
+- Run all tests to ensure code quality
+- Stop the running service
+- Build the binary
+- Copy it to `/usr/local/bin/sstpd`
+- Start the systemd service
+
 ## Systemd Service
 
 Create `/etc/systemd/system/sstpd.service`:
 
 ```
+
+```
+

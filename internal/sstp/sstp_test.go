@@ -9,11 +9,11 @@ import (
 
 // TestHandleInvalidContentLength tests that requests with invalid Content-Length are rejected
 func TestHandleInvalidContentLength(t *testing.T) {
-	// Create a mock HTTP request with invalid Content-Length
+	// Create a mock HTTP request with an invalid Content-Length that's too large
 	request := `SSTP_DUPLEX_POST / HTTP/1.1
 Host: localhost
 Content-Type: application/sstp
-Content-Length: 18446744073709551615
+Content-Length: 999999999999999999999
 
 `
 
