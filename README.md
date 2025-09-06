@@ -53,11 +53,42 @@ On CentOS/RHEL:
 sudo yum install -y ppp git golang
 ```
 
-## Building
+## Building and Running
+
+To build the server, run:
 
 ```bash
 go build -o sstpd ./cmd/sstpd
 ```
+
+To run the server (requires root):
+
+```bash
+sudo ./sstpd
+```
+
+## Deployment
+
+For production deployment, the server can be installed as a systemd service:
+
+1. Copy the service file: `sudo cp sstpd.service /etc/systemd/system/`
+2. Reload systemd: `sudo systemctl daemon-reload`
+3. Enable the service: `sudo systemctl enable sstpd`
+4. Start the service: `sudo systemctl start sstpd`
+
+## Automatic Deployment
+
+A deployment script [deploy.sh](deploy.sh) is provided to automate the process of updating, building, and restarting the service. To use it:
+
+1. Transfer the script to your Linux server
+2. Make it executable: `chmod +x deploy.sh`
+3. Run with sudo: `sudo ./deploy.sh`
+
+The script will:
+- Pull the latest changes from git
+- Build the binary
+- Copy it to `/usr/local/bin/sstpd`
+- Restart the systemd service
 
 ## Configuration
 
@@ -97,14 +128,6 @@ sudo ufw allow 443/tcp
 # Or with iptables
 sudo iptables -A INPUT -p tcp --dport 443 -j ACCEPT
 ```
-
-## Running the Server
-
-```bash
-sudo ./sstpd
-```
-
-Note: The server needs to be run with sudo because it binds to port 443 (privileged port) and manages PPP connections.
 
 ## Control API
 
