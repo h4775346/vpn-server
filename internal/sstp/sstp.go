@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -230,19 +229,21 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 }
 
 func (s *Server) negotiate(r *bufio.Reader, w io.Writer) error {
-	// Read 4-byte SSTP header
+	// 1) اقرأ ترويسة SSTP
 	hdr := make([]byte, 4)
 	if _, err := io.ReadFull(r, hdr); err != nil {
 		return fmt.Errorf("read header: %w", err)
 	}
 	if hdr[0] != sstpV10 || (hdr[1]&ctrlBit) == 0 {
-		s.logger.Errorf("bad first 4 bytes: %s", hex.EncodeToString(hdr))
+		s.logger.Errorf("bad first 4 bytes: %02x %02x %02x %02x", hdr[0], hdr[1], hdr[2], hdr[3])
 		return fmt.Errorf("invalid CCR header")
 	}
 	length := int(binary.BigEndian.Uint16(hdr[2:]) & 0x0FFF)
 	if length < 8 {
 		return fmt.Errorf("short CCR length %d", length)
 	}
+
+	// 2) جسم الرسالة
 	body := make([]byte, length-4)
 	if _, err := io.ReadFull(r, body); err != nil {
 		return fmt.Errorf("read body: %w", err)
@@ -251,37 +252,44 @@ func (s *Server) negotiate(r *bufio.Reader, w io.Writer) error {
 		return fmt.Errorf("expected CALL_CONNECT_REQUEST")
 	}
 
-	// Validate that client proposed PPP encapsulation
-	attrCount := int(binary.BigEndian.Uint16(body[2:4]))
-	pos := 5
+	// 3) افحص السمات بتسلسل حتى نهاية الجسم
+	// تنسيق السمة: [Reserved:1][AttrID:1][Len:2 شامل الترويسة][Value...]
 	encapOK := false
-	for i := 0; i < attrCount && pos+4 <= len(body); i++ {
-		attrID := int(body[pos+1]) // [Reserved][ID][LenHi][LenLo]...
+	for pos := 5; pos+4 <= len(body); {
+		attrID := int(body[pos+1])
 		alen := int(binary.BigEndian.Uint16(body[pos+2:pos+4]) & 0x0FFF)
-		if pos+alen > len(body) {
-			return fmt.Errorf("attribute overrun")
+
+		// تحقق صرامي
+		if alen < 4 || pos+alen > len(body) {
+			s.logger.Errorf("malformed attribute id=%d len=%d at pos=%d bodylen=%d", attrID, alen, pos, len(body))
+			return fmt.Errorf("malformed attribute")
 		}
+
+		valStart := pos + 4
+		valEnd := pos + alen
+
 		if attrID == attrEncapsulatedProto {
-			if alen >= 6 {
-				if binary.BigEndian.Uint16(body[pos+4:pos+6]) == encapPPP {
+			if valEnd-valStart >= 2 {
+				proto := binary.BigEndian.Uint16(body[valStart : valStart+2])
+				if proto == encapPPP {
 					encapOK = true
 				}
 			}
 		}
-		pos += alen
+
+		pos = valEnd
 	}
 	if !encapOK {
 		return fmt.Errorf("client did not propose PPP encapsulation")
 	}
 
-	// Send Call Connect Ack with Crypto Binding Request (SHA256 only) and server nonce
+	// 4) أرسل Call Connect Ack مع Crypto Binding Request
 	ack := s.buildCCAWithCBR()
 	if _, err := w.Write(ack); err != nil {
 		return fmt.Errorf("write CCA: %w", err)
 	}
 
-	// Optionally send Call Connected here if your client expects it early
-	// Many clients send it later; MikroTik accepts early CC as well.
+	// 5) أرسل Call Connected مبكراً، مقبول لدى MikroTik
 	cc := buildCallConnected()
 	if _, err := w.Write(cc); err != nil {
 		return fmt.Errorf("write CC: %w", err)
