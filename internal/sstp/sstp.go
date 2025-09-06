@@ -26,7 +26,6 @@ const (
 
 	msgCallConnectRequest = 0x0001
 	msgCallConnectAck     = 0x0002
-	msgCallConnected      = 0x0004
 )
 
 type Server struct {
@@ -180,10 +179,10 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		}
 	}
 
+	// Per MS-SSTP 4.1: respond with 200, ULONGLONG_MAX Content-Length, server header. No Content-Type.
 	resp := "HTTP/1.1 200 OK\r\n" +
 		"Content-Length: 18446744073709551615\r\n" +
-		"Content-Type: application/soap+xml\r\n" +
-		"Server: sstpd\r\n" +
+		"Server: Microsoft-HTTPAPI/2.0\r\n" +
 		"\r\n"
 	if _, err := io.WriteString(conn, resp); err != nil {
 		s.logger.Errorf("failed to write SSTP HTTP response to %s: %v", remoteAddr, err)
@@ -220,6 +219,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 }
 
 func (s *Server) runSSTP(ctx context.Context, session *SSTPSession, r *bufio.Reader) error {
+	// expect CALL_CONNECT_REQUEST
 	hdr, payload, err := readSSTPPacket(r)
 	if err != nil {
 		return fmt.Errorf("read first SSTP packet: %w", err)
@@ -231,16 +231,14 @@ func (s *Server) runSSTP(ctx context.Context, session *SSTPSession, r *bufio.Rea
 		return fmt.Errorf("unexpected control message 0x%04x", binary.BigEndian.Uint16(payload[0:2]))
 	}
 
+	// reply with CALL_CONNECT_ACK including Crypto Binding Request
 	if err := writeCallConnectAck(session.Conn); err != nil {
 		return fmt.Errorf("write CALL_CONNECT_ACK: %w", err)
 	}
 
-	if err := writeCallConnected(session.Conn); err != nil {
-		return fmt.Errorf("write CALL_CONNECTED: %w", err)
-	}
-
 	errCh := make(chan error, 2)
 
+	// client -> PPP
 	go func() {
 		for {
 			h, pl, err := readSSTPPacket(r)
@@ -252,17 +250,17 @@ func (s *Server) runSSTP(ctx context.Context, session *SSTPSession, r *bufio.Rea
 				if len(pl) == 0 {
 					continue
 				}
-				_, werr := session.PPP.PTY().Write(pl)
-				if werr != nil {
+				if _, werr := session.PPP.PTY().Write(pl); werr != nil {
 					errCh <- werr
 					return
 				}
 			} else {
-				// ignore control after connected for now
+				// ignore further control for now, client will later send CALL_CONNECTED
 			}
 		}
 	}()
 
+	// PPP -> client
 	go func() {
 		buf := make([]byte, 4096)
 		for {
@@ -322,44 +320,29 @@ func readSSTPPacket(r *bufio.Reader) (sstpHeader, []byte, error) {
 }
 
 func writeCallConnectAck(w io.Writer) error {
+	// control message header: type and attributes count
 	body := make([]byte, 0, 48-4)
 	tmp := make([]byte, 4)
 	binary.BigEndian.PutUint16(tmp[0:2], msgCallConnectAck)
 	binary.BigEndian.PutUint16(tmp[2:4], 1)
 	body = append(body, tmp...)
 
-	body = append(body, 0x00) // Reserved1
-	body = append(body, 0x04) // Attribute ID = CRYPTO_BINDING_REQ
+	// attribute: Crypto Binding Request (ID 0x04), length 0x028
+	body = append(body, 0x00) // Reserved
+	body = append(body, 0x04) // Attribute ID
 	len1 := uint16(0x028)
-	lpack := (0x0000 | (len1 & 0x0FFF))
 	tmp2 := make([]byte, 2)
-	binary.BigEndian.PutUint16(tmp2, lpack)
+	binary.BigEndian.PutUint16(tmp2, len1&0x0FFF)
 	body = append(body, tmp2...)
-	body = append(body, 0x00, 0x00, 0x00) // Reserved2
+	body = append(body, 0x00, 0x00, 0x00) // Reserved1
 
-	body = append(body, byte(0x03)) // SHA1|SHA256 allowed
+	// hash protocol bitmask: allow SHA1 and SHA256
+	body = append(body, byte(0x03))
+
+	// nonce 32 bytes
 	nonce := make([]byte, 32)
 	_, _ = rand.Read(nonce)
 	body = append(body, nonce...)
-
-	totalLen := uint16(4 + len(body))
-	hdr := make([]byte, 4)
-	hdr[0] = sstpVersion10
-	hdr[1] = ctrlBit
-	binary.BigEndian.PutUint16(hdr[2:4], totalLen&0x0FFF)
-
-	if _, err := w.Write(hdr); err != nil {
-		return err
-	}
-	_, err := w.Write(body)
-	return err
-}
-
-func writeCallConnected(w io.Writer) error {
-	// Minimal Call Connected with zero attributes
-	body := make([]byte, 4)
-	binary.BigEndian.PutUint16(body[0:2], msgCallConnected)
-	binary.BigEndian.PutUint16(body[2:4], 0)
 
 	totalLen := uint16(4 + len(body))
 	hdr := make([]byte, 4)
