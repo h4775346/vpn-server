@@ -32,6 +32,26 @@ A production-grade MVP for an SSTP VPN server implemented in Go.
 └─ etc/ppp/chap-secrets      # PPP chap-secrets file (example)
 ```
 
+## Logging
+
+The server provides detailed logging for debugging and monitoring purposes:
+
+- `[DEBUG]` level logs provide detailed information about internal operations
+- `[INFO]` level logs show normal operational events
+- `[WARN]` level logs indicate potential issues
+- `[ERROR]` level logs show errors that may affect functionality
+
+Enhanced logging has been added to help diagnose PPP connection issues, including:
+- Detailed PPP session creation and teardown
+- Data flow between SSTP and PPP layers
+- Error conditions and their causes
+- Session management events
+
+To view logs:
+```bash
+journalctl -u sstpd -f
+```
+
 ## Installation
 
 ### Prerequisites
@@ -97,6 +117,3 @@ The script will:
 Create `/etc/systemd/system/sstpd.service`:
 
 ```
-
-```
-

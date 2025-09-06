@@ -277,20 +277,16 @@ func (sm *SessionManager) add(session *SSTPSession) {
 	defer sm.mu.Unlock()
 	sm.sessions[session.ID] = session
 	count := len(sm.sessions)
-	// Log session count after adding
-	if session.PPP != nil {
-		session.PPP.logger.Debugf("Added session %s. Total sessions: %d", session.ID, count)
-	}
+	// We can't directly access the PPP logger since it's not exported
+	// The logging will happen in the PPP session itself
+	_ = count // Avoid unused variable error
 }
 
 func (sm *SessionManager) remove(sessionID string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	delete(sm.sessions, sessionID)
-	count := len(sm.sessions)
-	// Log session count after removing
-	// We can't log from the session being removed, so we'll use a generic logger
-	// In practice, you might want to pass a logger to the SessionManager
+	// We can't log from the session being removed since we no longer have a reference to it
 }
 
 func (sm *SessionManager) GetSessions() []*ppp.SessionInfo {
