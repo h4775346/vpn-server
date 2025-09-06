@@ -76,6 +76,33 @@ For production deployment, the server can be installed as a systemd service:
 3. Enable the service: `sudo systemctl enable sstpd`
 4. Start the service: `sudo systemctl start sstpd`
 
+## Systemd Service
+
+Create `/etc/systemd/system/sstpd.service`:
+
+```ini
+[Unit]
+Description=Custom SSTP Server (Go) – PPP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/sstpd
+Restart=on-failure
+AmbientCapabilities=CAP_NET_ADMIN
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then enable and start the service:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable sstpd
+sudo systemctl start sstpd
+```
+
 ## Automatic Deployment
 
 A deployment script [deploy.sh](deploy.sh) is provided to automate the process of updating, building, and restarting the service. To use it:
@@ -86,9 +113,10 @@ A deployment script [deploy.sh](deploy.sh) is provided to automate the process o
 
 The script will:
 - Pull the latest changes from git
+- Stop the running service
 - Build the binary
 - Copy it to `/usr/local/bin/sstpd`
-- Restart the systemd service
+- Start the systemd service
 
 ## Configuration
 
@@ -189,30 +217,3 @@ The Go code requires no changes for RADIUS integration.
    ```bash
    curl -k https://SERVER_IP:8080/sessions
    ```
-
-## Systemd Service
-
-Create `/etc/systemd/system/sstpd.service`:
-
-```ini
-[Unit]
-Description=Custom SSTP Server (Go) – PPP
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/sstpd
-Restart=on-failure
-AmbientCapabilities=CAP_NET_ADMIN
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Then enable and start the service:
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable sstpd
-sudo systemctl start sstpd
-```

@@ -47,12 +47,22 @@ else
     exit 1
 fi
 
+# Stop the service before building and replacing binary
+log "Stopping sstpd service..."
+if systemctl stop sstpd; then
+    log "Service stopped successfully"
+else
+    warn "Failed to stop service (might not be running)"
+fi
+
 # Build the binary
 log "Building the SSTP server binary..."
 if go build -o sstpd ./cmd/sstpd; then
     log "Build successful"
 else
     error "Build failed"
+    # Try to restart the service since build failed
+    systemctl start sstpd
     exit 1
 fi
 
@@ -62,15 +72,17 @@ if cp sstpd /usr/local/bin/sstpd; then
     log "Binary copied successfully"
 else
     error "Failed to copy binary"
+    # Try to restart the service since copy failed
+    systemctl start sstpd
     exit 1
 fi
 
 # Restart the service
-log "Restarting sstpd service..."
-if systemctl restart sstpd; then
-    log "Service restarted successfully"
+log "Starting sstpd service..."
+if systemctl start sstpd; then
+    log "Service started successfully"
 else
-    error "Failed to restart service"
+    error "Failed to start service"
     exit 1
 fi
 
