@@ -218,24 +218,34 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 
 // handleSSTPProtocol handles the SSTP protocol after HTTP handshake
 func (s *Server) handleSSTPProtocol(ctx context.Context, session *SSTPSession) {
+	s.logger.Debugf("Starting SSTP protocol handler for session %s", session.ID)
+
 	sessionCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	defer func() {
+		cancel()
+		s.logger.Debugf("SSTP protocol handler ended for session %s", session.ID)
+	}()
 
 	errChan := make(chan error, 2)
 
 	go func() {
+		s.logger.Debugf("Starting data pump for session %s", session.ID)
 		err := session.PPP.PumpData(sessionCtx, session.Conn, session.Conn)
+		s.logger.Debugf("Data pump finished for session %s with error: %v", session.ID, err)
 		errChan <- err
 	}()
 
 	go func() {
+		s.logger.Debugf("Starting SSTP control message handler for session %s", session.ID)
 		buf := make([]byte, 1500)
 		for {
-			_, err := session.Conn.Read(buf)
+			n, err := session.Conn.Read(buf)
 			if err != nil {
+				s.logger.Debugf("SSTP control message read error for session %s: %v (read %d bytes)", session.ID, err, n)
 				errChan <- err
 				return
 			}
+			s.logger.Debugf("Received %d bytes of SSTP control data for session %s", n, session.ID)
 			// TODO: implement SSTP control frames parsing and keepalives
 		}
 	}()
@@ -266,12 +276,21 @@ func (sm *SessionManager) add(session *SSTPSession) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.sessions[session.ID] = session
+	count := len(sm.sessions)
+	// Log session count after adding
+	if session.PPP != nil {
+		session.PPP.logger.Debugf("Added session %s. Total sessions: %d", session.ID, count)
+	}
 }
 
 func (sm *SessionManager) remove(sessionID string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	delete(sm.sessions, sessionID)
+	count := len(sm.sessions)
+	// Log session count after removing
+	// We can't log from the session being removed, so we'll use a generic logger
+	// In practice, you might want to pass a logger to the SessionManager
 }
 
 func (sm *SessionManager) GetSessions() []*ppp.SessionInfo {
