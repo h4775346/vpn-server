@@ -1,0 +1,13 @@
+[Unit]
+Description=Custom SSTP Server (Go) – PPP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/sstpd
+Restart=on-failure
+AmbientCapabilities=CAP_NET_ADMIN
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

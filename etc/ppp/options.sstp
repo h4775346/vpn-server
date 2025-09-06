@@ -1,0 +1,14 @@
+name sstp
+refuse-pap
+refuse-chap
+require-mschap-v2
+require-mppe
+mtu 1400
+mru 1400
+lock
+nodefaultroute
+proxyarp
+lcp-echo-interval 20
+lcp-echo-failure 3
+ms-dns 8.8.8.8
+ms-dns 1.1.1.1
