@@ -27,7 +27,7 @@ type Config struct {
 // Load loads configuration from environment variables or uses defaults
 func Load() *Config {
 	cfg := &Config{
-		ListenAddr:         getEnv("SSTP_LISTEN_ADDR", ":443"),
+		ListenAddr:         getEnv("SSTP_LISTEN_ADDR", ":4443"), // Changed default to 4443
 		APIListenAddr:      getEnv("SSTP_API_LISTEN_ADDR", ":8080"),
 		CAKeyPath:          getEnv("SSTP_CA_KEY_PATH", "/etc/sstpd/pki/ca.key"),
 		CACertPath:         getEnv("SSTP_CA_CERT_PATH", "/etc/sstpd/pki/ca.crt"),
