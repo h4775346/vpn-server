@@ -229,11 +229,13 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 }
 
 func (s *Server) negotiate(r *bufio.Reader, w io.Writer) error {
-	// read SSTP header
+	// 1) اقرأ ترويسة SSTP
 	hdr := make([]byte, 4)
 	if _, err := io.ReadFull(r, hdr); err != nil {
 		return fmt.Errorf("read header: %w", err)
 	}
+	s.logger.Debugf("CCR hdr hex=%s", hex0(hdr, 64))
+
 	if hdr[0] != sstpV10 || (hdr[1]&ctrlBit) == 0 {
 		return fmt.Errorf("invalid CCR header")
 	}
@@ -242,33 +244,42 @@ func (s *Server) negotiate(r *bufio.Reader, w io.Writer) error {
 		return fmt.Errorf("short CCR length %d", length)
 	}
 
-	// read body
+	// 2) جسم الرسالة
 	body := make([]byte, length-4)
 	if _, err := io.ReadFull(r, body); err != nil {
 		return fmt.Errorf("read body: %w", err)
+	}
+	s.logger.Debugf("CCR body len=%d hex=%s", len(body), hex0(body, 128))
+
+	if len(body) < 5 {
+		return fmt.Errorf("CCR body too short %d", len(body))
 	}
 	if binary.BigEndian.Uint16(body[0:2]) != msgCallConnectRequest {
 		return fmt.Errorf("expected CALL_CONNECT_REQUEST")
 	}
 
-	// parse attributes; accept both formats:
+	// 3) افحص السمات متسلسلة حتى نهاية الجسم
+	// ندعم تخطيطين:
 	// A: [Reserved:1][AttrID:1][Len:2][Value...]
-	// B: [AttrID:1][Len:2][Value...]   (seen on MikroTik)
+	// B: [AttrID:1][Len:2][Value...]
 	encapOK := false
-	for pos := 2 + 2 + 1; pos < len(body); {
+	for pos := 5; pos < len(body); {
 		remain := len(body) - pos
-		if remain < 3 { // need at least id+len
+		if remain < 3 {
+			s.logger.Debugf("attrs: stop at pos=%d remain=%d", pos, remain)
 			break
 		}
 
-		// try layout A
+		// جرّب التخطيط A
 		useA := false
 		var idA byte
 		var lenA int
 		if remain >= 4 {
 			idA = body[pos+1]
 			lenA = int(binary.BigEndian.Uint16(body[pos+2:pos+4]) & 0x0FFF)
-			if lenA >= 4 && pos+lenA <= len(body) && idA != 0 {
+			validA := lenA >= 4 && pos+lenA <= len(body)
+			s.logger.Debugf("try A at pos=%d id=%d len=%d valid=%t", pos, idA, lenA, validA)
+			if validA && idA != 0 {
 				useA = true
 			}
 		}
@@ -277,26 +288,46 @@ func (s *Server) negotiate(r *bufio.Reader, w io.Writer) error {
 			valStart := pos + 4
 			valEnd := pos + lenA
 			if idA == attrEncapsulatedProto {
-				if valEnd-valStart >= 2 && binary.BigEndian.Uint16(body[valStart:valStart+2]) == encapPPP {
-					encapOK = true
+				if valEnd-valStart >= 2 {
+					proto := binary.BigEndian.Uint16(body[valStart : valStart+2])
+					s.logger.Debugf("attr ENCAP proto=0x%04x", proto)
+					if proto == encapPPP {
+						encapOK = true
+					}
+				} else {
+					s.logger.Debugf("attr ENCAP too short: vs=%d ve=%d", valStart, valEnd)
 				}
+			} else {
+				s.logger.Debugf("attr id=%d len=%d", idA, lenA)
 			}
 			pos = valEnd
 			continue
 		}
 
-		// fallback layout B
+		// جرّب التخطيط B
 		idB := body[pos]
 		lenB := int(binary.BigEndian.Uint16(body[pos+1:pos+3]) & 0x0FFF)
-		if lenB < 3 || pos+lenB > len(body) {
+		validB := lenB >= 3 && pos+lenB <= len(body)
+		s.logger.Debugf("try B at pos=%d id=%d len=%d valid=%t", pos, idB, lenB, validB)
+		if !validB {
+			s.logger.Errorf("malformed attribute window pos=%d remain=%d idB=%d lenB=%d bodylen=%d tail=%s",
+				pos, remain, idB, lenB, len(body), hex0(body[pos:], 64))
 			return fmt.Errorf("malformed attribute")
 		}
 		valStart := pos + 3
 		valEnd := pos + lenB
 		if idB == attrEncapsulatedProto {
-			if valEnd-valStart >= 2 && binary.BigEndian.Uint16(body[valStart:valStart+2]) == encapPPP {
-				encapOK = true
+			if valEnd-valStart >= 2 {
+				proto := binary.BigEndian.Uint16(body[valStart : valStart+2])
+				s.logger.Debugf("attr ENCAP proto=0x%04x", proto)
+				if proto == encapPPP {
+					encapOK = true
+				}
+			} else {
+				s.logger.Debugf("attr ENCAP too short: vs=%d ve=%d", valStart, valEnd)
 			}
+		} else {
+			s.logger.Debugf("attr id=%d len=%d", idB, lenB)
 		}
 		pos = valEnd
 	}
@@ -305,19 +336,29 @@ func (s *Server) negotiate(r *bufio.Reader, w io.Writer) error {
 		return fmt.Errorf("client did not propose PPP encapsulation")
 	}
 
-	// send Call Connect Ack with Crypto Binding Request
+	// 4) أرسل Call Connect Ack مع Crypto Binding Request
 	ack := s.buildCCAWithCBR()
 	if _, err := w.Write(ack); err != nil {
 		return fmt.Errorf("write CCA: %w", err)
 	}
+	s.logger.Debugf("sent CCA with CBR")
 
-	// send Call Connected
+	// 5) أرسل Call Connected
 	cc := buildCallConnected()
 	if _, err := w.Write(cc); err != nil {
 		return fmt.Errorf("write CC: %w", err)
 	}
+	s.logger.Debugf("sent CC")
 
 	return nil
+}
+
+// hex0: تفريغ hex مختصر
+func hex0(b []byte, max int) string {
+	if len(b) > max {
+		return fmt.Sprintf("%x...", b[:max])
+	}
+	return fmt.Sprintf("%x", b)
 }
 
 func (s *Server) buildCCAWithCBR() []byte {
