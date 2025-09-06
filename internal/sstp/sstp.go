@@ -11,11 +11,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/user/sstpd/internal/config"
-	"github.com/user/sstpd/internal/logging"
-	"github.com/user/sstpd/internal/netutil"
-	"github.com/user/sstpd/internal/pki"
-	"github.com/user/sstpd/internal/ppp"
+	"github.com/h4775346/vpn-server/internal/config"
+	"github.com/h4775346/vpn-server/internal/logging"
+	"github.com/h4775346/vpn-server/internal/netutil"
+	"github.com/h4775346/vpn-server/internal/pki"
+	"github.com/h4775346/vpn-server/internal/ppp"
 )
 
 // Server represents the SSTP server

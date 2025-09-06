@@ -1,4 +1,4 @@
-module github.com/user/sstpd
+module github.com/h4775346/vpn-server
 
 go 1.22
 

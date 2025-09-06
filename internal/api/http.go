@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/user/sstpd/internal/config"
-	"github.com/user/sstpd/internal/logging"
-	"github.com/user/sstpd/internal/pki"
-	"github.com/user/sstpd/internal/sstp"
+	"github.com/h4775346/vpn-server/internal/config"
+	"github.com/h4775346/vpn-server/internal/logging"
+	"github.com/h4775346/vpn-server/internal/pki"
+	"github.com/h4775346/vpn-server/internal/sstp"
 )
 
 // Server represents the HTTP control API server

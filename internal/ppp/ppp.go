@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
-	"github.com/user/sstpd/internal/logging"
+	"github.com/h4775346/vpn-server/internal/logging"
 )
 
 // Session represents a PPP session
