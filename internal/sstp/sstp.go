@@ -80,13 +80,17 @@ func NewServer(cfg *config.Config, logger *logging.Logger) (*Server, error) {
 	// Configure TLS
 	server.tlsConf = &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
+		MinVersion:   tls.VersionTLS10, // جرّب الأول ولو الراوتر بيدعم TLS1.2 رجّعها
+		CurvePreferences: []tls.CurveID{
+			tls.CurveP256, tls.CurveP384, tls.X25519,
+		},
 		CipherSuites: []uint16{
-			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-			// Add more cipher suites as needed
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+			tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+			tls.TLS_RSA_WITH_AES_256_CBC_SHA,
 		},
 	}
 
@@ -150,7 +154,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	}
 
 	// Check if this is an SSTP connection request
-	if req.Method != "SSTP_DUPLEX_POST" && req.Header.Get("Content-Type") != "application/sstp" {
+	if req.Method != "SSTP_DUPLEX_POST" {
 		s.logger.Warnf("Invalid SSTP request from %s", remoteAddr)
 		// We can't use http.Error here because we're not in an HTTP handler context
 		// Just close the connection
