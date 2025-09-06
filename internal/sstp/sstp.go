@@ -22,17 +22,13 @@ import (
 
 const (
 	sstpVersion10 = 0x10
+	ctrlBit       = 0x01
 
-	// control bit masks in second header byte
-	ctrlBit = 0x01
-
-	// control message types
 	msgCallConnectRequest = 0x0001
 	msgCallConnectAck     = 0x0002
 	msgCallConnected      = 0x0004
 )
 
-// Server represents the SSTP server
 type Server struct {
 	config   *config.Config
 	logger   *logging.Logger
@@ -42,13 +38,11 @@ type Server struct {
 	wg       sync.WaitGroup
 }
 
-// SessionManager manages active SSTP sessions
 type SessionManager struct {
 	sessions map[string]*SSTPSession
 	mu       sync.RWMutex
 }
 
-// SSTPSession represents an SSTP session
 type SSTPSession struct {
 	ID        string
 	Conn      net.Conn
@@ -57,7 +51,6 @@ type SSTPSession struct {
 	RemoteIP  string
 }
 
-// NewServer creates a new SSTP server
 func NewServer(cfg *config.Config, logger *logging.Logger) (*Server, error) {
 	server := &Server{
 		config: cfg,
@@ -73,7 +66,6 @@ func NewServer(cfg *config.Config, logger *logging.Logger) (*Server, error) {
 		publicIP = net.ParseIP("127.0.0.1")
 	}
 
-	// ensure CA before issuing server cert
 	if err := pki.EnsureCA(cfg.CAKeyPath, cfg.CACertPath); err != nil {
 		return nil, fmt.Errorf("failed to ensure CA: %w", err)
 	}
@@ -95,7 +87,7 @@ func NewServer(cfg *config.Config, logger *logging.Logger) (*Server, error) {
 
 	server.tlsConf = &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS10, // للتوافق مع بعض أجهزة MikroTik القديمة
+		MinVersion:   tls.VersionTLS10,
 		CurvePreferences: []tls.CurveID{
 			tls.CurveP256, tls.CurveP384, tls.X25519,
 		},
@@ -112,14 +104,12 @@ func NewServer(cfg *config.Config, logger *logging.Logger) (*Server, error) {
 	return server, nil
 }
 
-// Start starts the SSTP server
 func (s *Server) Start(ctx context.Context) error {
-	var err error
-	s.listener, err = tls.Listen("tcp", s.config.ListenAddr, s.tlsConf)
+	ln, err := tls.Listen("tcp", s.config.ListenAddr, s.tlsConf)
 	if err != nil {
 		return fmt.Errorf("failed to start TLS listener: %w", err)
 	}
-
+	s.listener = ln
 	s.logger.Infof("SSTP server listening on %s", s.config.ListenAddr)
 
 	for {
@@ -166,7 +156,6 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 
 	br := bufio.NewReader(conn)
 
-	// parse request line
 	line, err := br.ReadString('\n')
 	if err != nil {
 		s.logger.Errorf("failed reading request line from %s: %v", remoteAddr, err)
@@ -179,7 +168,6 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	// headers
 	for {
 		h, err := br.ReadString('\n')
 		if err != nil {
@@ -192,7 +180,6 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		}
 	}
 
-	// response with infinite content length
 	resp := "HTTP/1.1 200 OK\r\n" +
 		"Content-Length: 18446744073709551615\r\n" +
 		"Content-Type: application/soap+xml\r\n" +
@@ -209,7 +196,6 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		OptionsPath:     s.config.PPPOptionsPath,
 		ChapSecretsPath: s.config.PPPChapSecretsPath,
 	}
-
 	pppSession, err := ppp.NewSession(sessionID, remoteIP, pppConfig, s.logger)
 	if err != nil {
 		s.logger.Errorf("Failed to create PPP session for %s: %v", remoteAddr, err)
@@ -226,7 +212,6 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	s.sessions.add(session)
 	defer s.sessions.remove(sessionID)
 
-	// SSTP control handshake then data pump
 	if err := s.runSSTP(ctx, session, br); err != nil {
 		if err != io.EOF {
 			s.logger.Errorf("Session %s error: %v", session.ID, err)
@@ -235,7 +220,6 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 }
 
 func (s *Server) runSSTP(ctx context.Context, session *SSTPSession, r *bufio.Reader) error {
-	// expect first control packet CALL_CONNECT_REQUEST
 	hdr, payload, err := readSSTPPacket(r)
 	if err != nil {
 		return fmt.Errorf("read first SSTP packet: %w", err)
@@ -243,20 +227,20 @@ func (s *Server) runSSTP(ctx context.Context, session *SSTPSession, r *bufio.Rea
 	if !hdr.control || len(payload) < 4 {
 		return fmt.Errorf("unexpected first SSTP packet")
 	}
-	msgType := binary.BigEndian.Uint16(payload[0:2])
-	if msgType != msgCallConnectRequest {
-		return fmt.Errorf("unexpected control message 0x%04x", msgType)
+	if binary.BigEndian.Uint16(payload[0:2]) != msgCallConnectRequest {
+		return fmt.Errorf("unexpected control message 0x%04x", binary.BigEndian.Uint16(payload[0:2]))
 	}
 
-	// send CALL_CONNECT_ACK with Crypto Binding Request
 	if err := writeCallConnectAck(session.Conn); err != nil {
 		return fmt.Errorf("write CALL_CONNECT_ACK: %w", err)
 	}
 
-	// data pump
+	if err := writeCallConnected(session.Conn); err != nil {
+		return fmt.Errorf("write CALL_CONNECTED: %w", err)
+	}
+
 	errCh := make(chan error, 2)
 
-	// from client to ppp: parse SSTP frames and forward only data payloads
 	go func() {
 		for {
 			h, pl, err := readSSTPPacket(r)
@@ -274,18 +258,11 @@ func (s *Server) runSSTP(ctx context.Context, session *SSTPSession, r *bufio.Rea
 					return
 				}
 			} else {
-				// ignore control after ack for now
-				if len(pl) >= 2 {
-					t := binary.BigEndian.Uint16(pl[0:2])
-					if t == msgCallConnected {
-						s.logger.Debugf("Session %s received CALL_CONNECTED", session.ID)
-					}
-				}
+				// ignore control after connected for now
 			}
 		}
 	}()
 
-	// from ppp to client: wrap bytes as SSTP Data packets
 	go func() {
 		buf := make([]byte, 4096)
 		for {
@@ -311,11 +288,10 @@ func (s *Server) runSSTP(ctx context.Context, session *SSTPSession, r *bufio.Rea
 	}
 }
 
-// SSTP header structure
 type sstpHeader struct {
 	version byte
 	control bool
-	length  uint16 // total packet length including header
+	length  uint16
 }
 
 func readN(r io.Reader, n int) ([]byte, error) {
@@ -346,51 +322,59 @@ func readSSTPPacket(r *bufio.Reader) (sstpHeader, []byte, error) {
 }
 
 func writeCallConnectAck(w io.Writer) error {
-	// build body: MsgType 0x0002, NumAttr 0x0001, then CryptoBindingRequest attribute
 	body := make([]byte, 0, 48-4)
-
-	// message type and attributes count
 	tmp := make([]byte, 4)
 	binary.BigEndian.PutUint16(tmp[0:2], msgCallConnectAck)
 	binary.BigEndian.PutUint16(tmp[2:4], 1)
 	body = append(body, tmp...)
 
-	// attribute header
-	body = append(body, 0x00)     // Reserved1
-	body = append(body, 0x04)     // Attribute ID = CRYPTO_BINDING_REQ
-	len1 := uint16(0x028)         // 40 bytes attribute length
+	body = append(body, 0x00) // Reserved1
+	body = append(body, 0x04) // Attribute ID = CRYPTO_BINDING_REQ
+	len1 := uint16(0x028)
 	lpack := (0x0000 | (len1 & 0x0FFF))
 	tmp2 := make([]byte, 2)
 	binary.BigEndian.PutUint16(tmp2, lpack)
 	body = append(body, tmp2...)
 	body = append(body, 0x00, 0x00, 0x00) // Reserved2
 
-	// Hash Protocol Bitmask: allow SHA1 and SHA256
-	body = append(body, byte(0x03))
-
-	// 32 byte nonce
+	body = append(body, byte(0x03)) // SHA1|SHA256 allowed
 	nonce := make([]byte, 32)
 	_, _ = rand.Read(nonce)
 	body = append(body, nonce...)
 
-	// now header
 	totalLen := uint16(4 + len(body))
 	hdr := make([]byte, 4)
 	hdr[0] = sstpVersion10
-	hdr[1] = ctrlBit      // control bit set
-	l := (totalLen & 0x0FFF)
-	binary.BigEndian.PutUint16(hdr[2:4], l)
+	hdr[1] = ctrlBit
+	binary.BigEndian.PutUint16(hdr[2:4], totalLen&0x0FFF)
 
-	_, err := w.Write(hdr)
-	if err != nil {
+	if _, err := w.Write(hdr); err != nil {
 		return err
 	}
-	_, err = w.Write(body)
+	_, err := w.Write(body)
+	return err
+}
+
+func writeCallConnected(w io.Writer) error {
+	// Minimal Call Connected with zero attributes
+	body := make([]byte, 4)
+	binary.BigEndian.PutUint16(body[0:2], msgCallConnected)
+	binary.BigEndian.PutUint16(body[2:4], 0)
+
+	totalLen := uint16(4 + len(body))
+	hdr := make([]byte, 4)
+	hdr[0] = sstpVersion10
+	hdr[1] = ctrlBit
+	binary.BigEndian.PutUint16(hdr[2:4], totalLen&0x0FFF)
+
+	if _, err := w.Write(hdr); err != nil {
+		return err
+	}
+	_, err := w.Write(body)
 	return err
 }
 
 func writeSSTPDataPacket(w io.Writer, payload []byte) error {
-	// split if payload larger than max 4091 as per spec
 	const max = 4091
 	offset := 0
 	for offset < len(payload) {
@@ -401,7 +385,7 @@ func writeSSTPDataPacket(w io.Writer, payload []byte) error {
 		totalLen := uint16(4 + len(chunk))
 		hdr := make([]byte, 4)
 		hdr[0] = sstpVersion10
-		hdr[1] = 0x00 // data packet
+		hdr[1] = 0x00
 		binary.BigEndian.PutUint16(hdr[2:4], totalLen&0x0FFF)
 
 		if _, err := w.Write(hdr); err != nil {
@@ -415,14 +399,9 @@ func writeSSTPDataPacket(w io.Writer, payload []byte) error {
 	return nil
 }
 
-// Wait waits for all connections to finish
-func (s *Server) Wait() {
-	s.wg.Wait()
-}
+func (s *Server) Wait() { s.wg.Wait() }
 
-func (s *Server) GetSessions() []*ppp.SessionInfo {
-	return s.sessions.GetSessions()
-}
+func (s *Server) GetSessions() []*ppp.SessionInfo { return s.sessions.GetSessions() }
 
 func (sm *SessionManager) add(session *SSTPSession) {
 	sm.mu.Lock()
@@ -439,12 +418,11 @@ func (sm *SessionManager) remove(sessionID string) {
 func (sm *SessionManager) GetSessions() []*ppp.SessionInfo {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-
-	sessions := make([]*ppp.SessionInfo, 0, len(sm.sessions))
-	for _, session := range sm.sessions {
-		if session.PPP != nil {
-			sessions = append(sessions, session.PPP.GetInfo())
+	out := make([]*ppp.SessionInfo, 0, len(sm.sessions))
+	for _, s := range sm.sessions {
+		if s.PPP != nil {
+			out = append(out, s.PPP.GetInfo())
 		}
 	}
-	return sessions
+	return out
 }
