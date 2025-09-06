@@ -3,7 +3,9 @@ package sstp
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -16,6 +18,18 @@ import (
 	"github.com/h4775346/vpn-server/internal/netutil"
 	"github.com/h4775346/vpn-server/internal/pki"
 	"github.com/h4775346/vpn-server/internal/ppp"
+)
+
+const (
+	sstpVersion10 = 0x10
+
+	// control bit masks in second header byte
+	ctrlBit = 0x01
+
+	// control message types
+	msgCallConnectRequest = 0x0001
+	msgCallConnectAck     = 0x0002
+	msgCallConnected      = 0x0004
 )
 
 // Server represents the SSTP server
@@ -59,6 +73,11 @@ func NewServer(cfg *config.Config, logger *logging.Logger) (*Server, error) {
 		publicIP = net.ParseIP("127.0.0.1")
 	}
 
+	// ensure CA before issuing server cert
+	if err := pki.EnsureCA(cfg.CAKeyPath, cfg.CACertPath); err != nil {
+		return nil, fmt.Errorf("failed to ensure CA: %w", err)
+	}
+
 	if err := pki.EnsureServerCertForIP(
 		cfg.ServerCertPath,
 		cfg.ServerKeyPath,
@@ -76,7 +95,7 @@ func NewServer(cfg *config.Config, logger *logging.Logger) (*Server, error) {
 
 	server.tlsConf = &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS10,
+		MinVersion:   tls.VersionTLS10, // للتوافق مع بعض أجهزة MikroTik القديمة
 		CurvePreferences: []tls.CurveID{
 			tls.CurveP256, tls.CurveP384, tls.X25519,
 		},
@@ -133,7 +152,6 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 }
 
-// handleConnection handles an incoming SSTP connection
 func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 
@@ -148,6 +166,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 
 	br := bufio.NewReader(conn)
 
+	// parse request line
 	line, err := br.ReadString('\n')
 	if err != nil {
 		s.logger.Errorf("failed reading request line from %s: %v", remoteAddr, err)
@@ -155,16 +174,12 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	}
 	line = strings.TrimRight(line, "\r\n")
 	parts := strings.SplitN(line, " ", 3)
-	if len(parts) < 3 {
-		s.logger.Errorf("bad request line from %s: %q", remoteAddr, line)
-		return
-	}
-	method := parts[0]
-	if method != "SSTP_DUPLEX_POST" {
-		s.logger.Warnf("not SSTP_DUPLEX_POST from %s: %s", remoteAddr, method)
+	if len(parts) < 3 || parts[0] != "SSTP_DUPLEX_POST" {
+		s.logger.Warnf("not SSTP_DUPLEX_POST from %s: %q", remoteAddr, line)
 		return
 	}
 
+	// headers
 	for {
 		h, err := br.ReadString('\n')
 		if err != nil {
@@ -175,10 +190,9 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		if h == "" {
 			break
 		}
-		// accept any Content-Length including 18446744073709551615
-		// accept Content-Type variations (e.g., application/soap+xml)
 	}
 
+	// response with infinite content length
 	resp := "HTTP/1.1 200 OK\r\n" +
 		"Content-Length: 18446744073709551615\r\n" +
 		"Content-Type: application/soap+xml\r\n" +
@@ -209,57 +223,196 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		StartTime: time.Now(),
 		RemoteIP:  remoteIP,
 	}
-
 	s.sessions.add(session)
 	defer s.sessions.remove(sessionID)
 
-	s.handleSSTPProtocol(ctx, session)
+	// SSTP control handshake then data pump
+	if err := s.runSSTP(ctx, session, br); err != nil {
+		if err != io.EOF {
+			s.logger.Errorf("Session %s error: %v", session.ID, err)
+		}
+	}
 }
 
-// handleSSTPProtocol handles the SSTP protocol after HTTP handshake
-func (s *Server) handleSSTPProtocol(ctx context.Context, session *SSTPSession) {
-	s.logger.Debugf("Starting SSTP protocol handler for session %s", session.ID)
+func (s *Server) runSSTP(ctx context.Context, session *SSTPSession, r *bufio.Reader) error {
+	// expect first control packet CALL_CONNECT_REQUEST
+	hdr, payload, err := readSSTPPacket(r)
+	if err != nil {
+		return fmt.Errorf("read first SSTP packet: %w", err)
+	}
+	if !hdr.control || len(payload) < 4 {
+		return fmt.Errorf("unexpected first SSTP packet")
+	}
+	msgType := binary.BigEndian.Uint16(payload[0:2])
+	if msgType != msgCallConnectRequest {
+		return fmt.Errorf("unexpected control message 0x%04x", msgType)
+	}
 
-	sessionCtx, cancel := context.WithCancel(ctx)
-	defer func() {
-		cancel()
-		s.logger.Debugf("SSTP protocol handler ended for session %s", session.ID)
-	}()
+	// send CALL_CONNECT_ACK with Crypto Binding Request
+	if err := writeCallConnectAck(session.Conn); err != nil {
+		return fmt.Errorf("write CALL_CONNECT_ACK: %w", err)
+	}
 
-	errChan := make(chan error, 2)
+	// data pump
+	errCh := make(chan error, 2)
 
+	// from client to ppp: parse SSTP frames and forward only data payloads
 	go func() {
-		s.logger.Debugf("Starting data pump for session %s", session.ID)
-		err := session.PPP.PumpData(sessionCtx, session.Conn, session.Conn)
-		s.logger.Debugf("Data pump finished for session %s with error: %v", session.ID, err)
-		errChan <- err
-	}()
-
-	go func() {
-		s.logger.Debugf("Starting SSTP control message handler for session %s", session.ID)
-		buf := make([]byte, 1500)
 		for {
-			n, err := session.Conn.Read(buf)
+			h, pl, err := readSSTPPacket(r)
 			if err != nil {
-				s.logger.Debugf("SSTP control message read error for session %s: %v (read %d bytes)", session.ID, err, n)
-				errChan <- err
+				errCh <- err
 				return
 			}
-			s.logger.Debugf("Received %d bytes of SSTP control data for session %s", n, session.ID)
-			// TODO: implement SSTP control frames parsing and keepalives
+			if !h.control {
+				if len(pl) == 0 {
+					continue
+				}
+				_, werr := session.PPP.PTY().Write(pl)
+				if werr != nil {
+					errCh <- werr
+					return
+				}
+			} else {
+				// ignore control after ack for now
+				if len(pl) >= 2 {
+					t := binary.BigEndian.Uint16(pl[0:2])
+					if t == msgCallConnected {
+						s.logger.Debugf("Session %s received CALL_CONNECTED", session.ID)
+					}
+				}
+			}
+		}
+	}()
+
+	// from ppp to client: wrap bytes as SSTP Data packets
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := session.PPP.PTY().Read(buf)
+			if n > 0 {
+				if werr := writeSSTPDataPacket(session.Conn, buf[:n]); werr != nil {
+					errCh <- werr
+					return
+				}
+			}
+			if err != nil {
+				errCh <- err
+				return
+			}
 		}
 	}()
 
 	select {
-	case <-sessionCtx.Done():
-		s.logger.Infof("Session %s cancelled", session.ID)
-	case err := <-errChan:
-		if err != io.EOF {
-			s.logger.Errorf("Session %s error: %v", session.ID, err)
-		} else {
-			s.logger.Infof("Session %s ended normally", session.ID)
-		}
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-errCh:
+		return err
 	}
+}
+
+// SSTP header structure
+type sstpHeader struct {
+	version byte
+	control bool
+	length  uint16 // total packet length including header
+}
+
+func readN(r io.Reader, n int) ([]byte, error) {
+	b := make([]byte, n)
+	_, err := io.ReadFull(r, b)
+	return b, err
+}
+
+func readSSTPPacket(r *bufio.Reader) (sstpHeader, []byte, error) {
+	var h sstpHeader
+	hdr, err := readN(r, 4)
+	if err != nil {
+		return h, nil, err
+	}
+	if hdr[0] != sstpVersion10 {
+		return h, nil, fmt.Errorf("unsupported SSTP version 0x%02x", hdr[0])
+	}
+	h.version = hdr[0]
+	h.control = (hdr[1] & ctrlBit) != 0
+	lenField := binary.BigEndian.Uint16(hdr[2:4]) & 0x0FFF
+	if lenField < 4 {
+		return h, nil, fmt.Errorf("invalid SSTP length %d", lenField)
+	}
+	h.length = lenField
+	payloadLen := int(lenField) - 4
+	payload, err := readN(r, payloadLen)
+	return h, payload, err
+}
+
+func writeCallConnectAck(w io.Writer) error {
+	// build body: MsgType 0x0002, NumAttr 0x0001, then CryptoBindingRequest attribute
+	body := make([]byte, 0, 48-4)
+
+	// message type and attributes count
+	tmp := make([]byte, 4)
+	binary.BigEndian.PutUint16(tmp[0:2], msgCallConnectAck)
+	binary.BigEndian.PutUint16(tmp[2:4], 1)
+	body = append(body, tmp...)
+
+	// attribute header
+	body = append(body, 0x00)     // Reserved1
+	body = append(body, 0x04)     // Attribute ID = CRYPTO_BINDING_REQ
+	len1 := uint16(0x028)         // 40 bytes attribute length
+	lpack := (0x0000 | (len1 & 0x0FFF))
+	tmp2 := make([]byte, 2)
+	binary.BigEndian.PutUint16(tmp2, lpack)
+	body = append(body, tmp2...)
+	body = append(body, 0x00, 0x00, 0x00) // Reserved2
+
+	// Hash Protocol Bitmask: allow SHA1 and SHA256
+	body = append(body, byte(0x03))
+
+	// 32 byte nonce
+	nonce := make([]byte, 32)
+	_, _ = rand.Read(nonce)
+	body = append(body, nonce...)
+
+	// now header
+	totalLen := uint16(4 + len(body))
+	hdr := make([]byte, 4)
+	hdr[0] = sstpVersion10
+	hdr[1] = ctrlBit      // control bit set
+	l := (totalLen & 0x0FFF)
+	binary.BigEndian.PutUint16(hdr[2:4], l)
+
+	_, err := w.Write(hdr)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(body)
+	return err
+}
+
+func writeSSTPDataPacket(w io.Writer, payload []byte) error {
+	// split if payload larger than max 4091 as per spec
+	const max = 4091
+	offset := 0
+	for offset < len(payload) {
+		chunk := payload[offset:]
+		if len(chunk) > max {
+			chunk = chunk[:max]
+		}
+		totalLen := uint16(4 + len(chunk))
+		hdr := make([]byte, 4)
+		hdr[0] = sstpVersion10
+		hdr[1] = 0x00 // data packet
+		binary.BigEndian.PutUint16(hdr[2:4], totalLen&0x0FFF)
+
+		if _, err := w.Write(hdr); err != nil {
+			return err
+		}
+		if _, err := w.Write(chunk); err != nil {
+			return err
+		}
+		offset += len(chunk)
+	}
+	return nil
 }
 
 // Wait waits for all connections to finish
@@ -267,7 +420,6 @@ func (s *Server) Wait() {
 	s.wg.Wait()
 }
 
-// GetSessions returns information about all active sessions
 func (s *Server) GetSessions() []*ppp.SessionInfo {
 	return s.sessions.GetSessions()
 }
@@ -276,17 +428,12 @@ func (sm *SessionManager) add(session *SSTPSession) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.sessions[session.ID] = session
-	count := len(sm.sessions)
-	// We can't directly access the PPP logger since it's not exported
-	// The logging will happen in the PPP session itself
-	_ = count // Avoid unused variable error
 }
 
 func (sm *SessionManager) remove(sessionID string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	delete(sm.sessions, sessionID)
-	// We can't log from the session being removed since we no longer have a reference to it
 }
 
 func (sm *SessionManager) GetSessions() []*ppp.SessionInfo {
