@@ -24,7 +24,7 @@ Content-Length: 999999999999999999999
 	if err == nil {
 		t.Fatalf("Expected error when parsing request with invalid Content-Length, but got none")
 	}
-	
+
 	// Check that the error is related to Content-Length
 	if !strings.Contains(err.Error(), "bad Content-Length") {
 		t.Errorf("Expected error to contain 'bad Content-Length', got: %v", err)

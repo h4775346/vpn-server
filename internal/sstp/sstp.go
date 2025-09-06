@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,14 +53,12 @@ func NewServer(cfg *config.Config, logger *logging.Logger) (*Server, error) {
 		},
 	}
 
-	// Detect public IP
 	publicIP, err := netutil.GetPublicIP()
 	if err != nil {
 		logger.Warnf("Failed to detect public IP, using localhost: %v", err)
 		publicIP = net.ParseIP("127.0.0.1")
 	}
 
-	// Ensure server certificate for the detected IP
 	if err := pki.EnsureServerCertForIP(
 		cfg.ServerCertPath,
 		cfg.ServerKeyPath,
@@ -71,16 +69,14 @@ func NewServer(cfg *config.Config, logger *logging.Logger) (*Server, error) {
 		return nil, fmt.Errorf("failed to ensure server certificate: %w", err)
 	}
 
-	// Load certificates
 	cert, err := tls.LoadX509KeyPair(cfg.ServerCertPath, cfg.ServerKeyPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load server certificate: %w", err)
 	}
 
-	// Configure TLS
 	server.tlsConf = &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS10, // جرّب الأول ولو الراوتر بيدعم TLS1.2 رجّعها
+		MinVersion:   tls.VersionTLS10,
 		CurvePreferences: []tls.CurveID{
 			tls.CurveP256, tls.CurveP384, tls.X25519,
 		},
@@ -107,7 +103,6 @@ func (s *Server) Start(ctx context.Context) error {
 
 	s.logger.Infof("SSTP server listening on %s", s.config.ListenAddr)
 
-	// Start accepting connections
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -120,7 +115,16 @@ func (s *Server) Start(ctx context.Context) error {
 			}
 		}
 
-		// Handle connection in a goroutine
+		if tc, ok := conn.(*tls.Conn); ok {
+			if err := tc.Handshake(); err != nil {
+				s.logger.Errorf("TLS handshake error: %v", err)
+				_ = tc.Close()
+				continue
+			}
+			cs := tc.ConnectionState()
+			s.logger.Infof("TLS negotiated with %s version=0x%x cipher=0x%x", conn.RemoteAddr().String(), cs.Version, cs.CipherSuite)
+		}
+
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
@@ -133,7 +137,6 @@ func (s *Server) Start(ctx context.Context) error {
 func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 
-	// Get remote IP
 	remoteAddr := conn.RemoteAddr().String()
 	remoteIP, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
@@ -143,73 +146,51 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 
 	s.logger.Infof("New connection from %s", remoteAddr)
 
-	// Create a buffered reader for HTTP parsing
-	reader := bufio.NewReader(conn)
+	br := bufio.NewReader(conn)
 
-	// Set a read timeout to prevent hanging on malformed requests
-	if tcpConn, ok := conn.(*tls.Conn); ok {
-		tcpConn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	}
-
-	// Parse initial HTTP request
-	req, err := http.ReadRequest(reader)
+	line, err := br.ReadString('\n')
 	if err != nil {
-		s.logger.Errorf("Failed to parse HTTP request from %s: %v", remoteAddr, err)
+		s.logger.Errorf("failed reading request line from %s: %v", remoteAddr, err)
+		return
+	}
+	line = strings.TrimRight(line, "\r\n")
+	parts := strings.SplitN(line, " ", 3)
+	if len(parts) < 3 {
+		s.logger.Errorf("bad request line from %s: %q", remoteAddr, line)
+		return
+	}
+	method := parts[0]
+	if method != "SSTP_DUPLEX_POST" {
+		s.logger.Warnf("not SSTP_DUPLEX_POST from %s: %s", remoteAddr, method)
 		return
 	}
 
-	// Reset the read deadline
-	if tcpConn, ok := conn.(*tls.Conn); ok {
-		tcpConn.SetReadDeadline(time.Time{})
+	for {
+		h, err := br.ReadString('\n')
+		if err != nil {
+			s.logger.Errorf("failed reading headers from %s: %v", remoteAddr, err)
+			return
+		}
+		h = strings.TrimRight(h, "\r\n")
+		if h == "" {
+			break
+		}
+		// accept any Content-Length including 18446744073709551615
+		// accept Content-Type variations (e.g., application/soap+xml)
 	}
 
-	// Check if this is an SSTP connection request
-	if req.Method != "SSTP_DUPLEX_POST" {
-		s.logger.Warnf("Invalid SSTP request method '%s' from %s", req.Method, remoteAddr)
-		// Send proper HTTP error response
-		conn.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: 18\r\n\r\nMethod Not Allowed"))
+	resp := "HTTP/1.1 200 OK\r\n" +
+		"Content-Length: 18446744073709551615\r\n" +
+		"Content-Type: application/soap+xml\r\n" +
+		"Server: sstpd\r\n" +
+		"\r\n"
+	if _, err := io.WriteString(conn, resp); err != nil {
+		s.logger.Errorf("failed to write SSTP HTTP response to %s: %v", remoteAddr, err)
 		return
 	}
 
-	// Validate Content-Type for SSTP
-	expectedContentType := "application/sstp"
-	if req.Header.Get("Content-Type") != expectedContentType {
-		s.logger.Warnf("Invalid Content-Type '%s' from %s, expected '%s'", req.Header.Get("Content-Type"), remoteAddr, expectedContentType)
-		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nBad Request"))
-		return
-	}
-
-	// For SSTP, Content-Length of 18446744073709551615 (ULONGLONG_MAX) is valid
-	// This indicates an unlimited or unknown content length, which is expected for tunneling
-	// Note: Go's HTTP parser will parse this as -1 due to overflow, which is the correct behavior
-	if req.ContentLength != -1 && req.ContentLength > 100*1024*1024 { // 100MB limit for non-SSTP requests
-		s.logger.Warnf("Invalid Content-Length %d from %s, closing connection", req.ContentLength, remoteAddr)
-		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nBad Request"))
-		return
-	}
-
-	// Send SSTP response
-	resp := &http.Response{
-		StatusCode: 200,
-		Proto:      "HTTP/1.1",
-		ProtoMajor: 1,
-		ProtoMinor: 1,
-		Header: http.Header{
-			"Content-Type": []string{"application/sstp"},
-		},
-		Body:          nil,
-		ContentLength: -1,
-	}
-
-	if err := resp.Write(conn); err != nil {
-		s.logger.Errorf("Failed to send SSTP response to %s: %v", remoteAddr, err)
-		return
-	}
-
-	// Create session ID
 	sessionID := fmt.Sprintf("%d", time.Now().UnixNano())
 
-	// Create PPP session
 	pppConfig := &ppp.Config{
 		OptionsPath:     s.config.PPPOptionsPath,
 		ChapSecretsPath: s.config.PPPChapSecretsPath,
@@ -221,7 +202,6 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	// Create SSTP session
 	session := &SSTPSession{
 		ID:        sessionID,
 		Conn:      conn,
@@ -230,52 +210,36 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		RemoteIP:  remoteIP,
 	}
 
-	// Register session
 	s.sessions.add(session)
-
-	// Remove session when done
 	defer s.sessions.remove(sessionID)
 
-	// Handle SSTP protocol
 	s.handleSSTPProtocol(ctx, session)
 }
 
 // handleSSTPProtocol handles the SSTP protocol after HTTP handshake
 func (s *Server) handleSSTPProtocol(ctx context.Context, session *SSTPSession) {
-	// Create context for this session
 	sessionCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Start pumping data between SSTP and PPP
 	errChan := make(chan error, 2)
 
-	// Pump data from SSTP to PPP
 	go func() {
 		err := session.PPP.PumpData(sessionCtx, session.Conn, session.Conn)
 		errChan <- err
 	}()
 
-	// Handle SSTP control messages (simplified)
 	go func() {
 		buf := make([]byte, 1500)
 		for {
-			// In a real implementation, we would parse SSTP control frames here
-			// For now, we just read and ignore control messages
 			_, err := session.Conn.Read(buf)
 			if err != nil {
 				errChan <- err
 				return
 			}
-
-			// TODO: Implement proper SSTP control message handling
-			// - Parse SSTP headers
-			// - Handle Call Connect, Call Connected messages
-			// - Send keepalive messages
-			// - Handle disconnection
+			// TODO: implement SSTP control frames parsing and keepalives
 		}
 	}()
 
-	// Wait for context cancellation or an error
 	select {
 	case <-sessionCtx.Done():
 		s.logger.Infof("Session %s cancelled", session.ID)
@@ -298,21 +262,18 @@ func (s *Server) GetSessions() []*ppp.SessionInfo {
 	return s.sessions.GetSessions()
 }
 
-// add adds a session to the manager
 func (sm *SessionManager) add(session *SSTPSession) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.sessions[session.ID] = session
 }
 
-// remove removes a session from the manager
 func (sm *SessionManager) remove(sessionID string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	delete(sm.sessions, sessionID)
 }
 
-// GetSessions returns information about all active sessions
 func (sm *SessionManager) GetSessions() []*ppp.SessionInfo {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
